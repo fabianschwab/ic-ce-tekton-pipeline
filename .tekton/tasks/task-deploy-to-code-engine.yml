@@ -1,0 +1,589 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-to-code-engine
+spec:
+  params:
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: secure-properties
+    - name: ibmcloud-apikey-secret-key
+      description: field in the secret that contains the api key used to login to ibmcloud
+      default: apikey
+    - name: app-name
+      description: name of the Code Engine application
+    - name: resource-group
+      description: target resource group (name or id) for the ibmcloud login operation
+    - name: region
+      description: target region for the ibmcloud login operation (if none is found it will default to the toolchain region)
+    - name: code-engine-project
+      description: name of the Code Engine project for deploying application
+    - name: service-bindings
+      description: JSON object of a map of names to services instances to be bound to the application
+      default: "{}"
+    - name: cpu
+      description: the amount of vCPU set for each instance of the application or job
+      default: "0.25"
+    - name: memory
+      description: the amount of memory set for each instance of the application or job
+      default: "0.5G"
+    - name: ephemeral-storage
+      description: the amount of ephemeral storage to set for each instance of the application or job
+      default: "0.4G"
+    - name: app-max-scale
+      description: maximum scale of the Code Engine application
+      default: "1"
+    - name: app-min-scale
+      description: minimum scale of the Code Engine application
+      default: "0"
+    - name: app-port
+      description: port where the application is listening
+      default: "8080"
+    - name: app-visibility
+      description: the visibility for the application. Valid values are 'public', 'private' and 'project'.
+      default: "public"
+    - name: app-concurrency
+      description: the maximum number of requests that can be processed concurrently per instance. 
+      default: "100"
+    - name: image-repository
+      description: the repository for the built image
+    - name: image-tags
+      description: the tags for the built image
+    - name: image-pull-secret
+      description: name of the image pull secret
+    - name: image-pull-secret-kind
+      description: user-managed or ce-managed (code-engine managed)
+    - name: shuttle-properties-file
+      description: name of the properties file that contain properties to include in the environment
+      default: "build.properties"
+    - name: pipeline-debug
+      description: Pipeline debug mode. Value can be 0 or 1. Default to 0
+      default: "0"
+    - name: task-image
+      description: image used to execute this task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+    - name: app-deployment-timeout
+      description: maximum timeout for the application deployment.
+      default: "300"
+    - name: deployment-type
+      description: Specifies the type of deployment. Valid values are 'application' and 'job'.
+      default: "application"
+    - name: job-instances
+      description: Specifies the number of instances that are used for runs of the job. When you use this option, the system converts to array indices. For example, if you specify 'instances' of 5, the system converts to 'array-indices' of '0 - 4'
+      default: "1"
+    - name: job-maxexecutiontime
+      description: The maximum execution time in seconds for runs of the job.
+      default: "7200"
+    - name: job-retrylimit
+      description: The number of times to rerun an instance of the job before the job is marked as failed.
+      default: "3"
+    - name: env-from-configmaps
+      description: semi-colon separated list of configmaps to set environment variables from
+      default: ""
+    - name: env-from-secrets
+      description: semi-colon separated list of secrets to set environment variables from
+      default: ""
+    - name: suffix-for-cd-auto-managed-configuration-resources
+      description: suffix for secret or configmap created based on CD environment properties
+      default: ""
+    - name: remove-unspecified-references-to-configuration-resources
+      description: remove references to unspecified configuration resources (configmap/secret) references (pulled from env-from-configmaps, env-from-secrets along with auto-managed by CD)
+      default: "false"
+  results:
+    - name: app-url
+      description: The running application's URL (obtained from APP_URL variable set by the executed script)
+  workspaces:
+    - name: artifacts
+      description: A workspace
+      mountPath: /artifacts
+  steps:
+    - name: execute
+      image: $(params.task-image)
+      workingDir: /artifacts
+      env:
+        - name: BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+        - name: PIPELINE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+        - name: PIPELINE_BLUEMIX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.ibmcloud-apikey-secret-key)
+        - name: SHUTTLE_PROPERTIES_FILE
+          value: $(params.shuttle-properties-file)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $(params.pipeline-debug) == 1 ]; then
+            env
+            pwd
+            ls -l
+            echo "=== cat /artifacts/_toolchain.json ==="
+            cat /artifacts/_toolchain.json
+            echo ""
+            echo "======================================"
+            trap env EXIT
+            set -x
+        fi
+
+        # function to create secret or configmap out of the environment properties
+        setup-ce-env-component_() {
+          local kind=$1
+          local cm_or_secret_name=$2
+
+          if [ "$kind" == "secret" ]; then
+            properties_files_path="/config/secure-properties"
+          else
+            properties_files_path="/config/environment-properties"
+          fi
+
+          props=$(mktemp)
+          # shellcheck disable=SC2086,SC2012
+          if [ "$(ls -1 ${properties_files_path}/CE_ENV_* 2>/dev/null | wc -l)" != "0" ]; then
+            # shellcheck disable=SC2086,SC2012
+            for prop in "${properties_files_path}/CE_ENV_"*; do
+              # shellcheck disable=SC2295
+              echo "${prop##${properties_files_path}/CE_ENV_}=$(cat $prop)" >> $props
+            done
+          fi
+
+          if [ -s "$props" ]; then
+            # shellcheck disable=SC2086
+            if ibmcloud ce $kind get --name "$cm_or_secret_name" > /dev/null 2>&1; then
+              # configmap get does not fail if non existing - use the json output to ensure existing or not
+              if [[ "$kind" == "configmap" && -z "$(ibmcloud ce $kind get --name "$cm_or_secret_name" --output json | jq -r '.metadata.name//empty')" ]]; then
+                echo "$kind $cm_or_secret_name does not exist. Creating it"
+                operation="create"
+              else
+                echo "$kind $cm_or_secret_name already exists. Updating it"
+                operation="update"
+              fi
+            else
+              echo "$kind $cm_or_secret_name does not exist. Creating it"
+              operation="create"
+            fi
+            # shellcheck disable=SC2086
+            ibmcloud ce $kind $operation --name "$cm_or_secret_name" --from-env-file "$props"
+            return 0
+          else
+            # no cm or secret created
+            return 1
+          fi
+        }
+
+        # function to return codeengine update parameters for configuration resources to remove
+        compute-env-configuration-resources-references-remove-parameters() {
+          # configmap or secret
+          local kind=$1
+          local entity_json_spec=$2
+          local params_for_env_from_configuration_resources=$3
+          if [ "$kind" == "configmap" ]; then
+             kindOfRef="configMapRef"
+             command="--env-from-configmap-rm"
+          else
+             kindOfRef="secretRef"
+             command="--env-from-secret-rm"
+          fi
+          rm_command_parameters=""
+          current_references=$(echo $entity_json_spec | jq -r --arg kindOfRef "$kindOfRef" '.envFrom[] | select(.[$kindOfRef]) | if has("prefix") then .prefix + "=" + .[$kindOfRef].name else .[$kindOfRef].name end')
+          while read -r a_reference; do
+            # check if current reference is still present in the params_for_env_from_configuration_resources
+            if [[ "$params_for_env_from_configuration_resources" != *"$a_reference"* ]]; then
+              # current reference is not required anymore
+              if [[ $a_reference == *"="* ]]; then
+                # use only the configmap or secret name
+                rm_command_parameter=" $command $(echo $a_reference | awk -F= '{print $2}')"
+              else
+                rm_command_parameter=" $command $a_reference"
+              fi
+              rm_command_parameters="$rm_command_parameters $rm_command_parameter"
+            fi
+          done <<< "$current_references"
+          echo $rm_command_parameters
+        }
+
+        # function to return codeengine update parameters for individual configuration resource to remove
+        compute-individual-configuration-resource-remove-parameters() {
+          local entity_json_spec=$1
+          local params_for_env_from_configmap=$2
+          local params_for_env_from_secret=$3
+
+          rm_command_parameters=""
+          current_individual_env_references=$(echo $entity_json_spec | jq -r '.env[] | select(has("valueFrom")) | (.valueFrom.configMapKeyRef//.valueFrom.secretKeyRef).key as $key | (.valueFrom.configMapKeyRef//.valueFrom.secretKeyRef).name as $resource_name | if .name == $key then $resource_name + ":" + $key else $resource_name + ":" + .name + "=" + $key end')
+          while read -r an_individual_env_reference; do
+            # check if current individual env reference is still present in the params_for_env_from_configmap or params_for_env_from_secret
+            if [[ "$params_for_env_from_configmap" != *"$an_individual_env_reference"* ]] && [[ "$params_for_env_from_secret" != *"$an_individual_env_reference"* ]]; then
+              # individual env rm command expect the environment variable name as argument
+              rm_command_parameters="$rm_command_parameters --env-rm $(echo "$an_individual_env_reference" | awk -F: '{print $2}' | awk -F= '{print $1}')"
+            fi
+          done <<< "$current_individual_env_references"
+          echo $rm_command_parameters
+        }
+
+        # SETUP BEGIN
+        ibmcloud config --check-version false
+        #
+        # Targetting the region and resource group
+        if [ "$(params.region)" ]; then
+          # if cluster region is in the 'ibm:yp:<region>' just keep the region part
+          IBM_CLOUD_REGION=$(echo "$(params.region)" | awk -F ':' '{print $NF;}')
+        else
+          IBM_CLOUD_REGION=$(jq -r '.region_id' /artifacts/_toolchain.json | awk -F: '{print $3}')
+        fi
+        ibmcloud login -a $(params.ibmcloud-api) -r $IBM_CLOUD_REGION --apikey $PIPELINE_BLUEMIX_API_KEY
+        ibmcloud target -g "$(params.resource-group)"
+
+        # View shuttle properties
+        if [ -n "$(params.shuttle-properties-file)" ]; then
+          if [ -f $(params.shuttle-properties-file) ]; then
+            cat $(params.shuttle-properties-file)
+
+            source $(params.shuttle-properties-file)
+            export $(cut -d= -f1 $(params.shuttle-properties-file))
+          else 
+            echo "WARNING: shuttle-properties-file provided is not existing - $(params.shuttle-properties-file)"
+          fi
+        fi
+
+        #
+        # Make sure that the latest version of Code Engine CLI is installed
+        echo "Install the Code Engine plugin"      
+        if ! ibmcloud plugin show code-engine >/dev/null 2>&1; then
+            ibmcloud plugin install code-engine
+        else
+            ibmcloud plugin update code-engine --force
+        fi
+
+        #
+        # Make sure the Code Engine project exists
+        echo "Selecting Code Engine project '$(params.code-engine-project)' ..."
+        if ibmcloud ce project select -n "$(params.code-engine-project)" > /dev/null 2>&1 ;
+          then 
+          echo "Selected the project."
+        else 
+          echo "IBM Code Engine project does not exists, Creating it..."
+          ibmcloud ce project  create -n "$(params.code-engine-project)"
+        fi
+
+        echo "Loading Kube config..."
+        ibmcloud ce proj select -n "$(params.code-engine-project)" -k
+
+        if [[ $(params.service-bindings) != "" ]]; then
+            RG_NAME=$(ibmcloud resource groups --output json | jq -r --arg RG "$(params.resource-group)" '.[] | select(.id==$RG) | .name')
+            # check to see if "$(params.resource-group)" is a name or an ID
+            if [[ "$RG_NAME" == "" ]]; then
+              RG_NAME="$(params.resource-group)"
+            fi
+            # check to see if $RG_NAME is not the default resource group
+            if [ $(ibmcloud resource groups --output json | jq -r --arg RG_NAME "$RG_NAME" '.[] | select(.name==$RG_NAME) | .default') == 'false' ]; then
+              echo "Updating Code Engine project to bind to resource group $RG_NAME..."
+              ibmcloud ce project update --binding-resource-group "$RG_NAME"
+            fi
+        fi
+
+        #
+        # Make sure the image is stored using the private ICR endpoint
+        # The Code Engine build will make sure that a corresponding registry secret is being created
+        IMAGE_URL="$(params.image-repository)"
+        if [[ ! $IMAGE_URL == private.* ]]; then
+            IMAGE_URL="private.$IMAGE_URL"
+            echo -e "Pointing image reference to private ICR location: $IMAGE_URL"
+        fi
+
+        #
+        # Make sure the secret to be used is existing
+        #
+        IMAGE_PULL_SECRET=$(params.image-pull-secret)
+        IMAGE_PULL_SECRET_KIND=$(params.image-pull-secret-kind)
+        if ! ibmcloud ce registry get --name "$IMAGE_PULL_SECRET" >/dev/null 2>&1; then
+          echo "registry-secret $IMAGE_PULL_SECRET is not existing"
+          if [[ "$IMAGE_PULL_SECRET_KIND" == "ce-managed" ]]; then
+            # if the secret is expected to be ce-managed but not present, then fallback to create a user one based on the apikey
+            # until https://github.ibm.com/coligo/cli/issues/3015 is available
+            PIPELINE_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /artifacts/_toolchain.json)
+            IMAGE_PULL_SECRET="ibmcloud-toolchain-${PIPELINE_TOOLCHAIN_ID}-${IBM_CLOUD_REGION}"
+            echo "user-managed registry-secret $IMAGE_PULL_SECRET will be created and used for this deployment."
+            # Check if the to-be-used user-managed secret exists
+            if ! ibmcloud ce registry get --name "$IMAGE_PULL_SECRET" >/dev/null 2>&1; then
+              # user-secret is not existing so process it as user-managed secret
+              IMAGE_PULL_SECRET_KIND="user-managed"
+            fi
+          fi
+          # Create the registry-secret with the proper apikey
+          if [[ "$IMAGE_PULL_SECRET_KIND" == "user-managed" ]]; then
+            ibmcloud ce registry create --name $IMAGE_PULL_SECRET --password $PIPELINE_BLUEMIX_API_KEY --server $(echo "$IMAGE_URL" | awk -F/ '{print $1}')
+          fi
+        fi
+
+        env_from_configmap_params="$(params.env-from-configmaps)"
+        if [ -n "$env_from_configmap_params" ]; then
+          # replace ; by appropriate parameter
+          env_from_configmap_params="--env-from-configmap ${env_from_configmap_params//;/ --env-from-configmap\ }"
+        fi
+
+        cm_toolchain_managed="cd-auto-${PIPELINE_ID}-cm$(params.suffix-for-cd-auto-managed-configuration-resources)"
+        if setup-ce-env-component_ "configmap" "$cm_toolchain_managed"; then
+          env_from_configmap_params="--env-from-configmap $cm_toolchain_managed $env_from_configmap_params"
+        fi
+
+        env_from_secret_params="$(params.env-from-secrets)"
+        if [ -n "$env_from_secret_params" ]; then
+          # replace ; by appropriate parameter
+          env_from_secret_params="--env-from-secret ${env_from_secret_params//;/ --env-from-secret\ }"
+        fi
+
+        secret_toolchain_managed="cd-auto-${PIPELINE_ID}-secret$(params.suffix-for-cd-auto-managed-configuration-resources)"
+        if setup-ce-env-component_ "secret" "$secret_toolchain_managed"; then
+          env_from_secret_params="--env-from-secret $secret_toolchain_managed $env_from_secret_params"
+        fi
+
+        echo "deployment type: $(params.deployment-type)"
+        if [[ $(params.deployment-type) == "application" ]]; then
+            echo "Deploying your code as Code Engine application '$(params.app-name)'..."
+
+            OPERATION="create"
+            json_file=$(mktemp)
+            if ibmcloud ce app get -n $(params.app-name) --output json > $json_file; then
+                echo "Code Engine app with name $(params.app-name) found, updating it"
+                OPERATION="update"
+                if [ "$(params.remove-unspecified-references-to-configuration-resources)" == "true" ]; then
+                  # ensure synchronization of references to configmaps or secrets for the given application
+                  json_spec=$(jq -c '.spec.template.spec.containers[0]' $json_file)
+                  env_from_configmap_rm_params=$(compute-env-configuration-resources-references-remove-parameters configmap "$json_spec" "$env_from_configmap_params")
+                  env_from_secret_rm_params=$(compute-env-configuration-resources-references-remove-parameters secret "$json_spec" "$env_from_secret_params")
+                  env_rm_params=$(compute-individual-configuration-resource-remove-parameters "$json_spec" "$env_from_configmap_params" "$env_from_secret_params")
+                fi
+            else
+                echo "Code Engine app with name $(params.app-name) not found, creating it"
+            fi
+
+            echo "   image: $IMAGE_URL:$(params.image-tags)"
+            echo "   registry-secret: $IMAGE_PULL_SECRET"
+            echo "   env-from-configmap parameters: $env_from_configmap_params"
+            echo "   env-from-secret parameters: $env_from_secret_params"
+            if [ -n "$env_from_configmap_rm_params" ]; then
+              echo "   env-from-configmap-rm parameters: $env_from_configmap_rm_params"
+            fi
+            if [ -n "$env_from_secret_rm_params" ]; then
+              echo "   env-from-secret-rm parameters: $env_from_secret_rm_params"
+            fi
+            if [ -n "$env_rm_params" ]; then
+              echo "   env-rm parameters: $env_rm_params"
+            fi
+            echo "   cpu: $(params.cpu)"
+            echo "   memory: $(params.memory)"
+            echo "   ephemeral-storage: $(params.ephemeral-storage)"
+            echo "   min: $(params.app-min-scale)"
+            echo "   max: $(params.app-max-scale)"
+            echo "   concurrency: $(params.app-concurrency)"
+            echo "   port: $(params.app-port)"
+            echo "   visibility: $(params.app-visibility)"
+            
+            ibmcloud ce app $OPERATION -n $(params.app-name) \
+                --image "$IMAGE_URL:$(params.image-tags)" \
+                --registry-secret "$IMAGE_PULL_SECRET" \
+                $env_from_configmap_params \
+                $env_from_secret_params \
+                $env_from_configmap_rm_params \
+                $env_from_secret_rm_params \
+                $env_rm_params \
+                --cpu $(params.cpu) \
+                --memory $(params.memory) \
+                --ephemeral-storage $(params.ephemeral-storage) \
+                --min $(params.app-min-scale) \
+                --max $(params.app-max-scale) \
+                --concurrency $(params.app-concurrency) \
+                --visibility $(params.app-visibility) \
+                --port $(params.app-port) \
+                --wait=false
+
+            # Bind services, if any
+            while read; do
+                NAME=$(echo "$REPLY" | jq -j '.key')
+                PREFIX=$(echo "$REPLY" | jq -j '.value')
+
+                if ! ibmcloud ce app get -n $(params.app-name) | grep "$NAME"; then
+                    ibmcloud ce app bind -n $(params.app-name) --si "$NAME" -p "$PREFIX" -w=false
+                fi
+            done < <(jq -c 'to_entries | .[]' <<<$(echo $(params.service-bindings) | base64 -d))
+
+            echo "Checking if application is ready..."
+            KUBE_SERVICE_NAME=$(params.app-name)
+
+            DEPLOYMENT_TIMEOUT=$(params.app-deployment-timeout)
+            echo "Timeout for the application deployment is ${DEPLOYMENT_TIMEOUT} seconds"
+            ITERATION=0
+            while [[ "${ITERATION}" -le "${DEPLOYMENT_TIMEOUT}" ]]; do
+                sleep 1
+
+                SVC_STATUS_READY=$(kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "True")')
+
+                SVC_STATUS_NOT_READY=$(kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "False")')
+
+                SVC_STATUS_UNKNOWN=$(kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status?.conditions[]?.status?|select(. == "Unknown")')
+
+                if [ \( -n "$SVC_STATUS_NOT_READY" \) -o \( -n "$SVC_STATUS_UNKNOWN" \) ]; then
+                    echo "Application not ready, retrying"
+                elif [ -n "$SVC_STATUS_READY" ]; then
+                    echo "Application is ready"
+                    ibmcloud ce app get --name $(params.app-name)
+                    break
+                else
+                    echo "Application status unknown, retrying"
+                fi
+                ITERATION="${ITERATION}"+1
+            done
+
+            if [ \( -n "$SVC_STATUS_NOT_READY" \) -o \( -n "$SVC_STATUS_UNKNOWN" \) ]; then
+                echo ""
+                echo "Gathering details to help troubleshooting the problem ..."
+                
+                echo ""
+                echo "Application details:"
+                echo "$(ibmcloud ce app get --name $(params.app-name) --output yaml)"
+                
+                echo ""
+                echo "Application events:"
+                echo "$(ibmcloud ce app events --app $(params.app-name))"
+                
+                echo ""
+                echo "Application logs:"
+                echo "$(ibmcloud ce app logs --app $(params.app-name) --all)"
+                
+                echo ""
+                echo "========================================================="
+                echo "DEPLOYMENT FAILED"
+                echo "========================================================="
+                echo "Application is not ready after waiting maximum time"
+
+                echo ""
+                echo "Please review the app details, events and logs printed above and check whether the output contains information which relates to the problem."
+                echo "Also, please see our troubleshooting guide https://cloud.ibm.com/docs/codeengine?topic=codeengine-ts-app-neverready and check for common issues."
+                echo ""
+                
+                exit 1
+            fi
+
+            # Determine app url for polling from knative service
+            TEMP_URL=$(kubectl get ksvc/${KUBE_SERVICE_NAME} -o json | jq '.status.url')
+            echo "Application status URL: $TEMP_URL"
+            TEMP_URL=${TEMP_URL%\"} # remove end quote
+            TEMP_URL=${TEMP_URL#\"} # remove beginning quote
+            APPLICATION_URL=$TEMP_URL
+            if [ -z "$APPLICATION_URL" ]; then
+                echo "Deploy failed, no URL found for application"
+                exit 1
+            fi
+            echo "Application is available"
+            echo "=========================================================="
+            echo -e "View the application at: $APPLICATION_URL"
+
+            # Record task results
+            echo -n "$APPLICATION_URL" >$(results.app-url.path)
+
+        else
+            echo "Deploying your code as Code Engine job......"
+
+            OPERATION="create"
+            json_file=$(mktemp)
+            if ibmcloud ce job get --name $(params.app-name) --output json > $json_file; then
+                echo "Code Engine job with name $(params.app-name) found, updating it"
+                OPERATION="update"
+                if [ "$(params.remove-unspecified-references-to-configuration-resources)" == "true" ]; then
+                  # ensure synchronization of references to configmaps or secrets for the given job
+                  json_spec=$(jq -c '.spec.template.containers[0]' $json_file)
+                  env_from_configmap_rm_params=$(compute-env-configuration-resources-references-remove-parameters configmap "$json_spec" "$env_from_configmap_params")
+                  env_from_secret_rm_params=$(compute-env-configuration-resources-references-remove-parameters secret "$json_spec" "$env_from_secret_params")
+                  env_rm_params=$(compute-individual-configuration-resource-remove-parameters "$json_spec" "$env_from_configmap_params" "$env_from_secret_params")
+                fi
+            else
+                echo "Code Engine job with name $(params.app-name) not found, creating it"
+            fi
+
+            echo "   image: $IMAGE_URL:$(params.image-tags)"
+            echo "   registry-secret: $IMAGE_PULL_SECRET"
+            echo "   env-from-configmap parameters: $env_from_configmap_params"
+            echo "   env-from-secret parameters: $env_from_secret_params"
+            if [ -n "$env_from_configmap_rm_params" ]; then
+              echo "   env-from-configmap-rm parameters: $env_from_configmap_rm_params"
+            fi
+            if [ -n "$env_from_secret_rm_params" ]; then
+              echo "   env-from-secret-rm parameters: $env_from_secret_rm_params"
+            fi
+            if [ -n "$env_rm_params" ]; then
+              echo "   env-rm parameters: $env_rm_params"
+            fi
+            echo "   cpu: $(params.cpu)"
+            echo "   memory: $(params.memory)"
+            echo "   ephemeral-storage: $(params.ephemeral-storage)"
+            echo "   instances: $(params.job-instances)"
+            echo "   maxexecutiontime: $(params.job-maxexecutiontime)"
+            echo "   retrylimit: $(params.job-retrylimit)"
+            
+            ibmcloud ce job $OPERATION -n $(params.app-name) \
+                --image "$IMAGE_URL:$(params.image-tags)" \
+                --registry-secret "$IMAGE_PULL_SECRET" \
+                $env_from_configmap_params \
+                $env_from_secret_params \
+                $env_from_configmap_rm_params \
+                $env_from_secret_rm_params \
+                $env_rm_params \
+                --cpu $(params.cpu) \
+                --memory $(params.memory) \
+                --ephemeral-storage $(params.ephemeral-storage) \
+                --instances "$(params.job-instances)" \
+                --maxexecutiontime "$(params.job-maxexecutiontime)" \
+                --retrylimit "$(params.job-retrylimit)"
+
+            # Bind services, if any
+            while read; do
+                NAME=$(echo "$REPLY" | jq -j '.key')
+                PREFIX=$(echo "$REPLY" | jq -j '.value')
+
+                if ! ibmcloud ce job get -n $(params.app-name) | grep "$NAME"; then
+                    ibmcloud ce job bind -n $(params.app-name) --si "$NAME" -p "$PREFIX" -w=false
+                fi
+            done < <(jq -c 'to_entries | .[]' <<<$(echo $(params.service-bindings) | base64 -d))
+            echo "Code Engine Job created/updated successfully."
+            
+            #
+            # Record task results
+            echo -n "Code Engine Job created/updated" >$(results.app-url.path)
+        fi
+
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /artifacts/_toolchain.json
+          subPath: toolchain.json
+          name: cd-config-volume
+        - mountPath: /config/environment-properties
+          name: environment-properties
+        - mountPath: /config/secure-properties
+          name: secure-properties
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: environment-properties
+      configMap:
+        name: environment-properties
+    - name: secure-properties
+      secret:
+        secretName: secure-properties

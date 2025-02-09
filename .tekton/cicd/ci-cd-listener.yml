@@ -1,0 +1,365 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: trigger-template-code-engine
+spec:
+  params:
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: repository
+      description: the git repo containing source code. If empty, the repository url will be found from toolchain
+      default: ""
+    - name: branch
+      description: the branch for the git repo
+      default: "main"
+    - name: revision
+      description: the git revision/commit for the git repo
+      default: ""
+    - name: git-token
+      description: access token for the git repo
+      default: ""
+    - name: fail-on-lint-errors
+      description: force failure of task when docker lint errors are found
+      default: "true"
+    - name: path-to-context
+      default: "."
+    - name: path-to-dockerfile
+      default: "."
+    - name: dockerfile
+      default: "Dockerfile"
+    - name: registry-region
+      description: The IBM Cloud region for image registry
+    - name: registry-namespace
+      description: container registry namespace
+    - name: registry-create-namespace
+      description: create container registry namespace if it doesn't already exists
+      default: "true"
+    - name: app-name
+      description: application name
+    - name: image-name
+      description: image name
+    - name: region
+      description: region of application deployment
+    - name: resource-group
+      description: resource group for the application deployment
+    - name: code-engine-project
+      description: Code Engine project for the application deployment
+    - name: pipeline-debug
+      description: Pipeline debug mode. Value can be 0 or 1. Default to 0
+      default: "0"
+    - name: custom-script
+      description: The command(s) to run the build in run-build step. It will override the default commands
+      default: ""
+    - name: env-from-configmaps
+      description: semi-colon separated list of configmaps to set environment variables from
+      default: ""
+    - name: env-from-secrets
+      description: semi-colon separated list of secrets to set environment variables from
+      default: ""
+    - name: suffix-for-cd-auto-managed-configuration-resources
+      description: suffix for secret or configmap created based on CD environment properties
+      default: ""
+    - name: remove-unspecified-references-to-configuration-resources
+      description: remove references to unspecified configuration resources (configmap/secret) references (pulled from env-from-configmaps, env-from-secrets along with auto-managed by CD)
+      default: "false"
+    - name: cpu
+      description: the amount of vCPU set for each instance of the application or job
+      default: "0.25"
+    - name: memory
+      description: the amount of memory set for each instance of the application or job
+      default: "0.5G"
+    - name: ephemeral-storage
+      description: the amount of ephemeral storage to set for each instance of the application or job
+      default: "0.4G"
+    - name: app-max-scale
+      description: maximum scale of the Code Engine job or application
+      default: "1"
+    - name: app-min-scale
+      description: minimum scale of the Code Engine application
+      default: "0"
+    - name: app-port
+      description: port where the application is listening
+      default: "8080"
+    - name: app-visibility
+      description: the visibility for the application. Valid values are 'public', 'private' and 'project'.
+      default: "public"
+    - name: app-concurrency
+      description: the maximum number of requests that can be processed concurrently per instance.
+      default: "100"
+    - name: service-bindings
+      description: service binding JSON for the application deployment
+      default: "{}"
+
+      #For health task
+    - name: app-health-endpoint
+      description: application health endpoint, e.g. /health
+      default: ""
+    - name: app-deployment-timeout
+      description: maximum timeout for the application deployment.
+      default: "300"
+
+      #IBM Cloud
+    - name: apikey
+      description: The ibmcloud api key
+
+    # User control params
+    - name: toolchain-build-image
+      description: Image to use for `build` task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+    - name: tester-tests-image
+      description: Image to use for `unit-test` task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+
+    # BuildPack related params
+    - name: build-strategy
+      description:  The strategy to use for building the image. Valid values are 'dockerfile' and 'buildpacks'.
+      default: "dockerfile"
+    - name: build-timeout
+      description: the amount of time, in seconds, that can pass before the build run must succeed or fail.
+      default: "600"
+    - name: build-size
+      description: the size to use for the build, which determines the amount of resources used. Valid values include small, medium, large, xlarge.
+      default: "medium"
+    - name: deployment-type
+      description:  Specifies the type of deployment. Valid values are 'application' and 'job'.
+      default: "application"
+    - name: build-use-native-docker
+      description:  Optional property to opt-in for using native docker build capabilities as opposed to use Code Engine build to containerize the source. Note this setting only takes effect if the build-strategy is set to 'dockerfile'. Valid values are 'true' and 'false'.
+      default: "false"
+    - name: wait-timeout
+      description: Maximum timeout for the CLI operation to wait.
+      default: "1300"
+
+    # Job specific configuration
+    - name: job-instances
+      description: Specifies the number of instances that are used for runs of the job. When you use this option, the system converts to array indices. For example, if you specify 'instances' of 5, the system converts to 'array-indices' of '0 - 4'
+      default: "1"
+    - name: job-maxexecutiontime
+      description: The maximum execution time in seconds for runs of the job.
+      default: "7200"
+    - name: job-retrylimit
+      description: The number of times to rerun an instance of the job before the job is marked as failed.
+      default: "3"
+
+  resourcetemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: code-engine-$(uid)-pvc
+      spec:
+        resources:
+          requests:
+            storage: 5Gi
+        volumeMode: Filesystem
+        accessModes:
+          - ReadWriteOnce
+    - apiVersion: v1
+      kind: Secret
+      metadata:
+        name: ci-cd-secret
+      type: Opaque
+      stringData:
+        API_KEY: $(params.apikey)
+        DOCKER_SECRET: $(params.docker-registry-secret)
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        name: code-engine-$(uid)
+      spec:
+        pipelineRef:
+          name: code-engine-pipeline
+        params:
+          - name: apikey
+            value: $(params.apikey)
+          - name: ibmcloud-api
+            value: $(params.ibmcloud-api)
+          - name: repository
+            value: $(params.repository)
+          - name: branch
+            value: $(params.branch)
+          - name: revision
+            value: $(params.revision)
+          - name: git-token
+            value: $(params.git-token)
+          - name: fail-on-lint-errors
+            value: $(params.fail-on-lint-errors)
+          - name: path-to-context
+            value: $(params.path-to-context)
+          - name: path-to-dockerfile
+            value: $(params.path-to-dockerfile)
+          - name: dockerfile
+            value: $(params.dockerfile)
+          - name: registry-region
+            value: $(params.registry-region)
+          - name: registry-namespace
+            value: $(params.registry-namespace)
+          - name: registry-create-namespace
+            value: $(params.registry-create-namespace)
+          - name: app-name
+            value: $(params.app-name)
+          - name: image-name
+            value: $(params.image-name)
+          - name: region
+            value: $(params.region)
+          - name: resource-group
+            value: $(params.resource-group)
+          - name: code-engine-project
+            value: $(params.code-engine-project)
+          - name: service-bindings
+            value: $(params.service-bindings)
+          - name: env-from-configmaps
+            value: $(params.env-from-configmaps)
+          - name: env-from-secrets
+            value: $(params.env-from-secrets)
+          - name: suffix-for-cd-auto-managed-configuration-resources
+            value: $(params.suffix-for-cd-auto-managed-configuration-resources)
+          - name: remove-unspecified-references-to-configuration-resources
+            value: $(params.remove-unspecified-references-to-configuration-resources)
+          - name: cpu
+            value: $(params.cpu)
+          - name: app-max-scale
+            value: $(params.app-max-scale)
+          - name: memory
+            value: $(params.memory)
+          - name: ephemeral-storage
+            value: $(params.ephemeral-storage)
+          - name: app-min-scale
+            value: $(params.app-min-scale)
+          - name: app-port
+            value: $(params.app-port)
+          - name: app-visibility
+            value: $(params.app-visibility)
+          - name: app-concurrency
+            value: $(params.app-concurrency)
+          - name: app-health-endpoint
+            value: $(params.app-health-endpoint)
+          - name: pipeline-debug
+            value: $(params.pipeline-debug)
+          - name: toolchain-build-image
+            value: $(params.toolchain-build-image)
+          - name: custom-script
+            value: $(params.custom-script)
+          - name: tester-tests-image
+            value: $(params.tester-tests-image)
+          - name: app-deployment-timeout
+            value: $(params.app-deployment-timeout)
+          - name: build-strategy
+            value: $(params.build-strategy)
+          - name: build-size
+            value: $(params.build-size)
+          - name: build-timeout
+            value: $(params.build-timeout)
+          - name: build-use-native-docker
+            value: $(params.build-use-native-docker)
+          - name: deployment-type
+            value: $(params.deployment-type)
+          - name: job-instances
+            value: $(params.job-instances)
+          - name: job-maxexecutiontime
+            value: $(params.job-maxexecutiontime)
+          - name: job-retrylimit
+            value: $(params.job-retrylimit)
+          - name: wait-timeout
+            value: $(params.wait-timeout)
+        workspaces:
+          - name: pipeline-ws
+            persistentVolumeClaim:
+              claimName: code-engine-$(uid)-pvc
+        podTemplate:
+          imagePullSecrets:
+            - name: custom-image-registry-pull-secret
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: trigger-binding-manual
+spec:
+  params:
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: manual-run
+spec:
+  triggers:
+    - binding:
+        name: trigger-binding-manual
+      template:
+        name: trigger-template-code-engine
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: github-commit
+spec:
+  params:
+    - name: repository
+      value: "$(event.repository.url)"
+    - name: branch
+      value: "$(event.ref)"
+    - name: revision
+      value: "$(event.head_commit.id)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: github-commit
+spec:
+  triggers:
+    - binding:
+        name: github-commit
+      template:
+        name: trigger-template-code-engine
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: grit-or-gitlab-commit
+spec:
+  params:
+    - name: repository
+      value: "$(event.repository.git_http_url)"
+    - name: branch
+      value: "$(event.ref)"
+    - name: revision
+      value: "$(event.checkout_sha)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: grit-or-gitlab-commit
+spec:
+  triggers:
+    - binding:
+        name: grit-or-gitlab-commit
+      template:
+        name: trigger-template-code-engine
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: bitbucket-commit
+spec:
+  params:
+    - name: repository
+      value: "$(event.repository.links.html.href)"
+    - name: revision
+      value: "$(event.push.changes[0].new.target.hash)"
+    - name: branch
+      value: "$(event.push.changes[0].new.name)"
+---
+apiVersion: tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: bitbucket-commit
+spec:
+  triggers:
+    - binding:
+        name: bitbucket-commit
+      template:
+        name: trigger-template-code-engine

@@ -1,0 +1,553 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: ci-cd-pipeline
+spec:
+  params:
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: repository
+      description: the git repo containing source code. If empty, the repository url will be found from toolchain
+      default: ""
+    - name: branch
+      description: the branch for the git repo
+      default: "main"
+    - name: revision
+      description: the git revision/commit for the git repo
+      default: ""
+    - name: git-token
+      description: access token for the git repo
+    - name: fail-on-lint-errors
+      description: force failure of task when docker lint errors are found
+      default: "true"
+    - name: path-to-context
+      default: "."
+    - name: path-to-dockerfile
+      default: "."
+    - name: dockerfile
+      default: "Dockerfile"
+    - name: registry-region
+      description: The IBM Cloud region for image registry
+    - name: registry-namespace
+      description: container registry namespace
+    - name: registry-create-namespace
+      description: create container registry namespace if it doesn't already exists
+      default: "true"
+    - name: app-name
+      description: application name
+    - name: image-name
+      description: image name
+    - name: region
+      description: region of application deployment
+    - name: resource-group
+      description: resource group for the application deployment
+    - name: code-engine-project
+      description: Code Engine project for the application deployment
+    - name: pipeline-debug
+      description: Pipeline debug mode. Value can be 0 or 1. Default to 0
+      default: "0"
+    - name: custom-script
+      description: The command(s) to run the build in run-build step. It will override the default commands
+    - name: env-from-configmaps
+      description: semi-colon separated list of configmaps to set environment variables from
+      default: ""
+    - name: env-from-secrets
+      description: semi-colon separated list of secrets to set environment variables from
+      default: ""
+    - name: suffix-for-cd-auto-managed-configuration-resources
+      description: suffix for secret or configmap created based on CD environment properties
+      default: ""
+    - name: remove-unspecified-references-to-configuration-resources
+      description: remove references to unspecified configuration resources (configmap/secret) references (pulled from env-from-configmaps, env-from-secrets along with auto-managed by CD)
+      default: "false"
+
+    - name: cpu
+      description: the amount of vCPU set for each instance of the application or job
+      default: "0.25"
+    - name: memory
+      description: the amount of memory set for each instance of the application or job
+      default: "0.5G"
+    - name: ephemeral-storage
+      description: the amount of ephemeral storage to set for each instance of the application or job
+      default: "0.4G"
+    - name: app-max-scale
+      description: maximum scale of the Code Engine application
+      default: "1"
+    - name: app-min-scale
+      description: minimum scale of the Code Engine application
+      default: "0"
+    - name: app-port
+      description: port where the application is listening
+      default: "8080"
+    - name: app-visibility
+      description: the visibility for the application. Valid values are 'public', 'private' and 'project'.
+      default: "public"
+    - name: app-concurrency
+      description: the maximum number of requests that can be processed concurrently per instance.
+      default: "100"
+    - name: service-bindings
+      description: JSON object of a map of names to services instances to be bound to the application
+      default: "{}"
+
+      # For health task
+    - name: app-health-endpoint
+      description: application health endpoint, e.g. /health
+      default: ""
+    - name: app-deployment-timeout
+      description: maximum timeout for the application deployment.
+      default: "300"
+
+      #IBM Cloud
+    - name: apikey
+      description: The ibmcloud api key
+
+    # User control params
+    - name: toolchain-build-image
+      description: Image to use for `build` task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+    - name: tester-tests-image
+      description: Image to use for `unit-test` task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+
+    # Build related params
+    - name: build-strategy
+      description:  The strategy to use for building the image. Valid values are 'dockerfile' and 'buildpacks'.
+      default: "dockerfile"
+    - name: build-timeout
+      description: the amount of time, in seconds, that can pass before the build run must succeed or fail.
+      default: "1200"
+    - name: build-size
+      description: the size to use for the build, which determines the amount of resources used. Valid values include small, medium, large, xlarge.
+      default: "large"
+    - name: deployment-type
+      description:  Specifies the type of deployment. Valid values are 'application' and 'job'.
+      default: "application"
+    - name: build-use-native-docker
+      description:  Optional property to opt-in for using native docker build capabilities as opposed to use Code Engine build to containerize the source. Note this setting only takes effect if the build-strategy is set to 'dockerfile'. Valid values are 'true' and 'false'.
+      default: "false"
+    - name: wait-timeout
+      description: Maximum timeout for the CLI operation to wait.
+      default: "1300"
+
+    # Job specific configuration
+    - name: job-instances
+      description: Specifies the number of instances that are used for runs of the job. When you use this option, the system converts to array indices. For example, if you specify 'instances' of 5, the system converts to 'array-indices' of '0 - 4'
+      default: "1"
+    - name: job-maxexecutiontime
+      description: The maximum execution time in seconds for runs of the job.
+      default: "7200"
+    - name: job-retrylimit
+      description: The number of times to rerun an instance of the job before the job is marked as failed.
+      default: "3"
+  workspaces:
+    - name: pipeline-ws
+  tasks:
+    - name: extract-repository-url
+      taskRef:
+        name: toolchain-extract-value
+      params:
+        - name: expression
+          # if a params.repository is given, it takes precedence
+          value: '. as $toolchain | ["$(params.repository)"] | if .[0]=="" then $toolchain | .services[] | select(.toolchain_binding.name=="repo") | .dashboard_url else .[0] end'
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+    - name: git-clone
+      taskRef:
+        name: git-clone-repo
+      params:
+        - name: ibmcloud-api
+          value: $(params.ibmcloud-api)
+        - name: git-access-token
+          value: $(params.git-token)
+        - name: continuous-delivery-context-secret
+          value: "secure-properties"
+        - name: ibmcloud-apikey-secret-key
+          value: "toolchain-apikey"
+        - name: repository
+          value: $(tasks.extract-repository-url.results.extracted-value)
+        - name: branch
+          value: $(params.branch)
+        - name: revision
+          value: $(params.revision)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+      workspaces:
+        - name: output
+          workspace: pipeline-ws
+    - name: docker-lint
+      when:
+        - input: "$(params.build-strategy)"
+          operator: in
+          values: ["dockerfile"]
+      runAfter: [git-clone]
+      taskRef:
+        name: linter-docker-lint
+      params:
+        - name: path-to-dockerfile
+          value: $(params.path-to-dockerfile)
+        - name: dockerfile
+          value: $(params.dockerfile)
+        - name: fail-on-lint-errors
+          value: $(params.fail-on-lint-errors)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+      workspaces:
+        - name: workspace
+          workspace: pipeline-ws
+    - name: build
+      runAfter: [git-clone]
+      taskRef:
+        name: toolchain-build
+      params:
+        - name: run-build-image
+          value: $(params.toolchain-build-image)
+        - name: custom-script
+          value: $(params.custom-script)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+      workspaces:
+        - name: output
+          workspace: pipeline-ws
+    - name: unit-tests
+      runAfter: [build]
+      taskRef:
+        name: tester-run-tests
+      params:
+        - name: tests-image
+          value: $(params.tester-tests-image)
+        - name: tests-script
+          value: |
+            if [ -f ./test/run-tests.sh ]; then
+              source ./test/run-tests.sh
+              echo -n $FILE_LOCATIONS > $(results.test-result-file-paths.path)
+              echo -n $TEST_TYPES > $(results.test-types.path)
+            else
+              echo "Test runner script not found: ./test/run-tests.sh"
+            fi
+      workspaces:
+        - name: artifacts
+          workspace: pipeline-ws
+    - name: containerize
+      runAfter: [build]
+      taskRef:
+        name: icr-execute-in-dind
+      params:
+        - name: ibmcloud-api
+          value: $(params.ibmcloud-api)
+        - name: continuous-delivery-context-secret
+          value: "secure-properties"
+        - name: container-registry-apikey-secret-key
+          value: "apikey"
+        - name: registry-create-namespace
+          value: $(params.registry-create-namespace)
+        - name: registry-region
+          value: $(params.registry-region)
+        - name: registry-namespace
+          value: $(params.registry-namespace)
+        - name: resource-group
+          value: $(params.resource-group)
+        - name: image-name
+          value: $(params.image-name)
+        - name: path-to-context
+          value: $(params.path-to-context)
+        - name: path-to-dockerfile
+          value: $(params.path-to-dockerfile)
+        - name: dockerfile
+          value: $(params.dockerfile)
+        - name: docker-commands
+          value: |
+            # Minting image tag using format: BUILD_NUMBER-BRANCH-COMMIT_ID-TIMESTAMP
+            # e.g. 3-main-50da6912-20181123114435
+            # (use build number as first segment to allow image tag as a patch release name according to semantic versioning)
+            GIT_BRANCH="$(tasks.git-clone.results.git-branch)"
+            GIT_COMMIT="$(tasks.git-clone.results.git-commit)"
+            TIMESTAMP=$( date -u "+%Y%m%d%H%M%S")
+            IMAGE_TAG=${TIMESTAMP}
+            if [ ! -z "${GIT_COMMIT}" ]; then
+              GIT_COMMIT_SHORT=$( echo ${GIT_COMMIT} | head -c 8 )
+              IMAGE_TAG=${GIT_COMMIT_SHORT}-${IMAGE_TAG}
+            fi
+            if [ ! -z "${GIT_BRANCH}" ]; then
+              GIT_BRANCH_TAG=$(echo -n $GIT_BRANCH | tr -c '[:alnum:]_.-' '_')
+              IMAGE_TAG=${GIT_BRANCH_TAG}-${IMAGE_TAG};
+            fi
+            IMAGE_TAG=${BUILD_NUMBER}-${IMAGE_TAG}
+            echo "Image tag: $IMAGE_TAG"
+
+            BUILD_STRATEGY="$(params.build-strategy)"
+            echo "Configured build strategy: $BUILD_STRATEGY"
+            if [[ "$BUILD_STRATEGY" == "dockerfile" && "$(params.build-use-native-docker)" == "true" ]]; then
+              echo "Using native docker build capabilities to build the application container image."
+
+              # Use docker build / inspect / push command
+              docker build --tag "$IMAGE_URL:$IMAGE_TAG" --file $PATH_TO_DOCKERFILE/$DOCKERFILE $PATH_TO_CONTEXT
+              docker inspect ${IMAGE_URL}:${IMAGE_TAG}
+              docker push ${IMAGE_URL}:${IMAGE_TAG}
+
+            else
+
+              #
+              # Setting up the IBM Cloud CLI including the Code Engine plugin
+              apk update
+              apk add curl
+              curl -fsSL https://clis.cloud.ibm.com/install/linux | sh
+
+              #
+              # Make sure that the latest version of Code Engine CLI is installed
+              echo "Install the Code Engine plugin"
+              if ! ibmcloud plugin show code-engine >/dev/null 2>&1; then
+                  ibmcloud plugin install code-engine
+              else
+                  ibmcloud plugin update code-engine --force
+              fi
+
+              #
+              # Targetting the region and resource group
+              if [ "$(params.region)" ]; then
+                # if cluster region is in the 'ibm:yp:<region>' just keep the region part
+                IBM_CLOUD_REGION=$(echo "$(params.region)" | awk -F ':' '{print $NF;}')
+              else
+                IBM_CLOUD_REGION=$(jq -r '.region_id' /artifacts/_toolchain.json | awk -F: '{print $3}')
+              fi
+              ibmcloud login --apikey "$(params.apikey)" -r "${IBM_CLOUD_REGION}"
+
+              ibmcloud target -g "$(params.resource-group)"
+              echo "Select Code engine project $(params.code-engine-project)"
+
+              #
+              # Make sure the Code Engine project exists
+              echo "Selecting Code Engine project '$(params.code-engine-project)' ..."
+              if ibmcloud ce project select -n "$(params.code-engine-project)" > /dev/null 2>&1 ;
+                then
+                echo "Selected the project."
+              else
+                echo "IBM Code Engine project does not exists, Creating it..."
+                ibmcloud ce project  create -n "$(params.code-engine-project)"
+              fi
+
+              #
+              # Make sure the image is stored using the private ICR endpoint
+              # The Code Engine build will make sure that a corresponding registry secret is being created
+              IMAGE_URL_TO_USE=$IMAGE_URL
+              if [[ ! $IMAGE_URL == private.* ]];
+              then
+                IMAGE_URL_TO_USE="private.$IMAGE_URL"
+                echo "Pointing image reference to private ICR location: '$IMAGE_URL_TO_USE'"
+              fi
+
+              #
+              # Check whether the repository defined a .ceignore to set optimize the build
+              # See https://cloud.ibm.com/docs/codeengine?topic=codeengine-plan-build#build-plan-repo
+              if [ ! -f ".ceignore" ]; then
+                echo "File .ceignore does not exist. Using '.dockerignore' or '.gitignore' instead"
+
+                # .gitignore will be used to define the .ceignore, if present
+                [ -f .gitignore ] && cp .gitignore .ceignore
+              fi
+              if [ -f ".ceignore" ]; then
+                echo "Following file patterns aren't considered as part of the build:"
+                cat .ceignore
+              fi
+
+              #
+              # Helper function which is used in case the Code Engine build fails.
+              print_mustgather () {
+
+                echo ""
+                echo "Gathering details to help troubleshooting the problem ..."
+
+                echo ""
+                echo "Build run details:"
+                echo "$(ibmcloud ce buildrun get --name $1)"
+
+                echo ""
+                echo "Build run events:"
+                echo "$(ibmcloud ce buildrun events --name $1)"
+
+                echo ""
+                echo "Build run logs:"
+                echo "$(ibmcloud ce buildrun logs --name $1)"
+
+                echo ""
+                echo "========================================================="
+                echo "BUILD FAILED"
+                echo "========================================================="
+                echo ""
+                echo "Please review the build details, events and logs printed above and check whether the output contains information which relates to the problem."
+                echo "Also, please see our troubleshooting guide https://cloud.ibm.com/docs/codeengine?topic=codeengine-ts-build-bldpush-stepfail and check for common issues."
+                echo ""
+              }
+
+              #
+              # Printing build configuration, prior submitting it
+              echo "Using Code Engine to build the application container image '$IMAGE_URL_TO_USE:$IMAGE_TAG'."
+              echo "   strategy: $BUILD_STRATEGY"
+              echo "   source: $PATH_TO_DOCKERFILE"
+              echo "   dockerfile: $DOCKERFILE"
+              echo "   context-dir: $PATH_TO_CONTEXT"
+              echo "   size: $(params.build-size)"
+              echo "   build timeout: $(params.build-timeout)"
+              echo "   wait timeout: $(params.wait-timeout)"
+
+              #
+              # Submit the build
+              # In case of an error print the logs
+              BUILD_RUN_NAME="toolchain-run-${PIPELINE_RUN_ID}"
+              ibmcloud ce buildrun submit --name "${BUILD_RUN_NAME}" \
+                  --source "$PATH_TO_DOCKERFILE" \
+                  --context-dir "$PATH_TO_CONTEXT" \
+                  --strategy "$BUILD_STRATEGY" \
+                  --size $(params.build-size) \
+                  --image "$IMAGE_URL_TO_USE:$IMAGE_TAG" \
+                  --timeout $(params.build-timeout) \
+                  --dockerfile "$DOCKERFILE" \
+                  --wait --wait-timeout $(params.wait-timeout) \
+                  || (print_mustgather "${BUILD_RUN_NAME}" && exit 1)
+
+              #
+              # Print the build run logs
+              ibmcloud ce buildrun logs --buildrun "${BUILD_RUN_NAME}"
+            fi
+
+            #
+            # Pull the image
+            docker pull ${IMAGE_URL}:${IMAGE_TAG}
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+      workspaces:
+        - name: source
+          workspace: pipeline-ws
+    - name: define-registry-secret-context
+      runAfter: [containerize]
+      params:
+        - name: image-repository
+          value: $(tasks.containerize.results.image-repository)
+        - name: registry-region
+          value: $(params.registry-region)
+        - name: build-strategy
+          value: $(params.build-strategy)
+        - name: build-use-native-docker
+          value: $(params.build-use-native-docker)
+      taskSpec:
+        params:
+          - name: image-repository
+          - name: registry-region
+          - name: build-strategy
+          - name: build-use-native-docker
+        results:
+          - name: image-pull-secret
+          - name: image-pull-secret-kind
+        steps:
+          - name: evaluate-build-context
+            image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46
+            script: |
+              #!/bin/bash
+              set -e -o pipefail
+              # if registry region is in the 'ibm:yp:<region>' just keep the region part
+              REGISTRY_REGION=$(echo "$(params.registry-region)" | awk -F ':' '{print $NF;}')
+
+              if [[ "$(params.build-strategy)" == "dockerfile" && "$(params.build-use-native-docker)" == "true" ]]; then
+                PIPELINE_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /cd-config/toolchain.json)
+                # docker native build used
+                # defined an name for the registry secret to be used
+                IMAGE_PULL_SECRET_KIND="user-managed"
+                IMAGE_PULL_SECRET="ibmcloud-toolchain-${PIPELINE_TOOLCHAIN_ID}-${REGISTRY_REGION}"
+              else
+                # code-engine build used
+                # the registry secret for this image is code-engine managed
+                IMAGE_PULL_SECRET_KIND="ce-managed"
+                IMAGE_PULL_SECRET="ce-auto-icr-private-$REGISTRY_REGION"
+              fi
+
+              # Record task results
+              echo -n "$IMAGE_PULL_SECRET_KIND" >$(results.image-pull-secret-kind.path)
+              echo -n "$IMAGE_PULL_SECRET" >$(results.image-pull-secret.path)
+
+            volumeMounts:
+              - mountPath: /cd-config
+                name: cd-config-volume
+        volumes:
+          - name: cd-config-volume
+            configMap:
+              name: toolchain
+              items:
+                - key: toolchain.json
+                  path: toolchain.json
+    - name: deploy-component
+      taskRef:
+        name: deploy-to-code-engine
+      runAfter: [define-registry-secret-context]
+      params:
+        - name: ibmcloud-api
+          value: $(params.ibmcloud-api)
+        - name: shuttle-properties-file
+          value: "build.properties"
+        - name: app-name
+          value: $(params.app-name)
+        - name: region
+          value: $(params.region)
+        - name: resource-group
+          value: $(params.resource-group)
+        - name: code-engine-project
+          value: $(params.code-engine-project)
+        - name: service-bindings
+          value: $(params.service-bindings)
+        - name: env-from-configmaps
+          value: $(params.env-from-configmaps)
+        - name: env-from-secrets
+          value: $(params.env-from-secrets)
+        - name: suffix-for-cd-auto-managed-configuration-resources
+          value: $(params.suffix-for-cd-auto-managed-configuration-resources)
+        - name: remove-unspecified-references-to-configuration-resources
+          value: $(params.remove-unspecified-references-to-configuration-resources)
+        - name: cpu
+          value: $(params.cpu)
+        - name: app-max-scale
+          value: $(params.app-max-scale)
+        - name: memory
+          value: $(params.memory)
+        - name: ephemeral-storage
+          value: $(params.ephemeral-storage)
+        - name: app-min-scale
+          value: $(params.app-min-scale)
+        - name: app-port
+          value: $(params.app-port)
+        - name: app-visibility
+          value: $(params.app-visibility)
+        - name: app-concurrency
+          value: $(params.app-concurrency)
+        - name: image-repository
+          value: $(tasks.containerize.results.image-repository)
+        - name: image-tags
+          value: $(tasks.containerize.results.image-tags)
+        - name: image-pull-secret
+          value: $(tasks.define-registry-secret-context.results.image-pull-secret)
+        - name: image-pull-secret-kind
+          value: $(tasks.define-registry-secret-context.results.image-pull-secret-kind)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
+        - name: app-deployment-timeout
+          value: $(params.app-deployment-timeout)
+        - name: deployment-type
+          value: $(params.deployment-type)
+        - name: job-instances
+          value: $(params.job-instances)
+        - name: job-maxexecutiontime
+          value: $(params.job-maxexecutiontime)
+        - name: job-retrylimit
+          value: $(params.job-retrylimit)
+      workspaces:
+        - name: artifacts
+          workspace: pipeline-ws
+    - name: check-application-health
+      taskRef:
+        name: check-health
+      runAfter: [deploy-component]
+      params:
+        - name: app-hostname
+          value: $(tasks.deploy-component.results.app-url)
+        - name: app-health-endpoint
+          value: $(params.app-health-endpoint)
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
