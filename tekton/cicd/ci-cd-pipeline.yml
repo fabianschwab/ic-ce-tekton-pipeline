@@ -563,3 +563,9 @@ spec:
           value: "oauth2proxy"
         - name: pipeline-debug
           value: $(params.pipeline-debug)
+        - name: ibmcloud-api
+          value: $(params.ibmcloud-api)
+        - name: region
+          value: $(params.region)
+        - name: resource-group
+          value: $(params.resource-group)
