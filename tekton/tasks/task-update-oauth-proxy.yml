@@ -1,0 +1,83 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: update-oauth-proxy
+spec:
+  params:
+    - name: code-engine-project
+      description: The name of the Code Engine project
+    - name: oauth-proxy-name
+      description: The name of the OAuth2Proxy application
+    - name: pipeline-debug
+      description: Pipeline debug mode
+      default: "0"
+    - name: task-image
+      description: image used to execute this task
+      default: "icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.46"
+  steps:
+    - name: update-oauth-proxy
+      image: $(params.task-image)
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+
+        if [ $(params.pipeline-debug) == 1 ]; then
+            pwd
+            env
+            trap env EXIT
+            set -x
+        fi
+
+        # Install latest version of Code Engine CLI
+        if ! ibmcloud plugin show code-engine >/dev/null 2>&1; then
+            ibmcloud plugin install code-engine
+        else
+            ibmcloud plugin update code-engine --force
+        fi
+
+        # Select the Code Engine project
+        echo "Selecting Code Engine project '$(params.code-engine-project)' ..."
+        ibmcloud ce project select -n "$(params.code-engine-project)"
+
+        # Get all applications and their private domains
+        echo "Getting all applications in the project..."
+        UPSTREAM_DOMAINS=""
+        while IFS= read -r line; do
+          if [[ $line =~ private ]]; then
+            domain=$(echo "$line" | awk '{print $2}')
+            if [ -n "$UPSTREAM_DOMAINS" ]; then
+              UPSTREAM_DOMAINS="${UPSTREAM_DOMAINS},"
+            fi
+            UPSTREAM_DOMAINS="${UPSTREAM_DOMAINS}http://${domain}"
+          fi
+        done < <(ibmcloud ce app list | grep -v "oauth2proxy")
+
+        if [ -z "$UPSTREAM_DOMAINS" ]; then
+          echo "No private domains found"
+          exit 0
+        fi
+
+        echo "Found private domains: $UPSTREAM_DOMAINS"
+
+        # Update OAuth2Proxy with new upstream domains
+        echo "Updating OAuth2Proxy configuration..."
+        ibmcloud ce app update \
+          --name $(params.oauth-proxy-name) \
+          --argument="--provider=oidc" \
+          --argument="--email-domain=ibm.com" \
+          --argument="--email-domain=de.ibm.com" \
+          --argument="--http-address=:4180" \
+          --argument="--pass-authorization-header=true" \
+          --argument="--insecure-oidc-allow-unverified-email=true" \
+          --argument="--pass-host-header=false" \
+          --argument="--skip-provider-button=true" \
+          --argument="--upstream-timeout=300s" \
+          --argument="--upstream=${UPSTREAM_DOMAINS}"
+
+        # Wait for the update to complete
+        echo "Waiting for OAuth2Proxy to restart..."
+        sleep 30
+
+        # Verify the update
+        echo "OAuth2Proxy configuration updated successfully"
+        ibmcloud ce app get --name $(params.oauth-proxy-name)

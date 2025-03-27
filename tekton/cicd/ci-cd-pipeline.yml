@@ -551,3 +551,15 @@ spec:
           value: $(params.app-health-endpoint)
         - name: pipeline-debug
           value: $(params.pipeline-debug)
+
+    - name: update-oauth-proxy
+      taskRef:
+        name: update-oauth-proxy
+      runAfter: [check-application-health]
+      params:
+        - name: code-engine-project
+          value: $(params.code-engine-project)
+        - name: oauth-proxy-name
+          value: "oauth2proxy"
+        - name: pipeline-debug
+          value: $(params.pipeline-debug)
